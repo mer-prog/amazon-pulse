@@ -90,13 +90,35 @@ amazon-pulse/
 
 ## Phase 別ロードマップ
 
-| Phase | 内容 | Day |
-|-------|------|-----|
-| 1 | LWA OAuth + SP-API client wrapper | 1 |
-| 2 | Data Pipeline 4種（orders / inventory / sales_reports / products） | 2 |
-| 3 | Rate Limit + Retry（token bucket / exponential backoff） | 3 |
-| 4 | EU/UK Multi-Region routing | 3 |
-| 5 | Web UI + Cloudflare Cron deploy | 4 |
+| Phase | 内容 | Day | Status |
+|-------|------|-----|--------|
+| 1 | LWA OAuth + SP-API client wrapper | 1 | ✅ done (commit `321a924`, 9 tests) |
+| 2 | Data Pipeline 4種（orders / inventory / sales_reports / products） | 2 | ✅ done (commit `6ace2e8`, 16 tests, migration 0002) |
+| 3 | Rate Limit + Retry（token bucket / exponential backoff） | 3 | ✅ done (commit `e1a97b9`, 12 tests) |
+| 4 | EU/UK Multi-Region routing | 3 | ✅ done (commit `ae6984b`, 12 tests) |
+| 5 | Web UI + Cloudflare Cron deploy | 4 | ✅ done (50 tests, migration 0003) |
+
+**Wave 1 complete** — 99 unit tests passing, 1 sandbox integration test skipped without credentials.
+
+### Phase 5 deliverables
+
+- `infrastructure/supabase/migrations/0003_phase5_demo_access.sql` — `sellers.is_demo` flag + anon-read RLS policies for the dashboard. The `sellers_public` view (security_invoker) hides the encrypted refresh_token column even if a future policy regression were to expose the table.
+- `packages/frontend/` — Next.js 14 App Router dashboard (Tailwind, in-house ui primitives), 24 tests. Uses **only** the public `anon` key; demo data is gated by `is_demo = true`. "Sandbox Demo" banner pinned at the top.
+- `packages/cloudflare-worker/` — `scheduled()` entry + per-job handlers (orders / inventory / sales_reports / products). Routes by cron string via `dispatch.ts`. `nodejs_compat` flag mirrors the env binding into `process.env` so the existing pipeline modules work unchanged.
+- `wrangler.toml` — 4 cron triggers (1 slot reserved):
+  - `0 */6 * * *`  → orders
+  - `15 */6 * * *` → inventory (offset to spread load)
+  - `0 0 * * *`    → sales_reports
+  - `0 0 * * 0`    → products (weekly)
+- README.md — Upwork-facing rewrite: mermaid architecture diagram, key features, deployment steps for both Cloudflare Pages (Dashboard) and `wrangler deploy`.
+
+### Phase 5 design decisions
+
+1. **Frontend uses the anon key, RLS gates everything**. The service-role key never crosses the wire. The dashboard reads the `sellers_public` view (column-filtered) instead of `public.sellers` directly — belt and braces.
+2. **CF Worker reuses the pipeline package via workspace import**. `nodejs_compat` flag + `populateProcessEnv()` shim avoids any pipeline refactor. `tsconfig paths` in the Worker package points `@amazon-pulse/pipeline` at `../pipeline/src/index.ts` so typecheck works without a pre-built `dist/`.
+3. **`runMarketplaceBatch` is the orchestrator inside the Worker** — region grouping + partial-failure isolation come for free from Phase 4.
+4. **Weekly + daily + 6h slots fit Free plan's 5-cron limit** with one trigger held in reserve.
+5. **Demo banner copy is portfolio-savvy**: explicitly Sandbox + leaves the door open for a paid production engagement.
 
 ## 作業ルール
 

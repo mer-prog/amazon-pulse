@@ -15,19 +15,21 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- ── sellers ────────────────────────────────────────────────────────────────
-insert into public.sellers (id, display_name, selling_partner_id, region, refresh_token_encrypted, is_active)
+insert into public.sellers (id, display_name, selling_partner_id, region, refresh_token_encrypted, is_active, is_demo)
 values
   ('11111111-1111-1111-1111-111111111111',
    'Demo Seller GmbH',
    'A1DEMOSELLER001',
    'eu',
    'enc:placeholder-not-a-real-token',
+   true,
    true),
   ('22222222-2222-2222-2222-222222222222',
    'Sample UK Trader Ltd',
    'A1DEMOSELLER002',
    'eu',
    'enc:placeholder-not-a-real-token',
+   true,
    true);
 
 -- ── seller_marketplaces ────────────────────────────────────────────────────
