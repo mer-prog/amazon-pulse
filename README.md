@@ -8,6 +8,17 @@ Fetches orders, inventory, sales reports, and product catalog data from Amazon's
 
 ---
 
+## Live Demo
+
+- **Production:** [amazon-pulse.pages.dev](https://amazon-pulse.pages.dev) (Sandbox-only mode)
+
+## Portfolio Specification
+
+- [日本語仕様書](./PORTFOLIO_SPEC_JP.md)
+- [English Specification](./PORTFOLIO_SPEC_EN.md)
+
+---
+
 ## What it does
 
 - 🛒 **Orders** — incremental sync of `getOrders` + `getOrderItems`, every 6 hours.
