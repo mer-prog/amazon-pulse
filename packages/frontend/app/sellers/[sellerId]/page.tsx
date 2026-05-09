@@ -109,7 +109,7 @@ export default async function SellerDetailPage({ params }: PageProps) {
                         <span className="text-ink-500">
                           {log.recordsUpserted ?? 0}/{log.recordsFetched ?? 0} rows
                         </span>
-                        <span className="text-ink-400">
+                        <span className="text-ink-500">
                           {formatDuration(log.startedAt, log.finishedAt)}
                         </span>
                         {log.errorMessage ? (

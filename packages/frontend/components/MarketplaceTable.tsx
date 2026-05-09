@@ -66,7 +66,9 @@ export function MarketplaceTable({ marketplaces, logs }: Props) {
               if (!log) {
                 return (
                   <Td key={job}>
-                    <span className="text-ink-300">—</span>
+                    <span className="text-ink-400" aria-hidden="true">
+                      —
+                    </span>
                   </Td>
                 );
               }
