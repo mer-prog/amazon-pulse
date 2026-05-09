@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit tests
+        env:
+          # CI-only test key. 32 bytes, base64-encoded. NOT used in production.
+          # Sandbox integration tests are auto-skipped without SP_API_* secrets.
+          ENCRYPTION_KEY: dGVzdF9rZXlfZm9yX2NpX29ubHlfbm90X2Zvcl9wcm8=
+        run: npm run test
