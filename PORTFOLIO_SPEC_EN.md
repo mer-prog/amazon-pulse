@@ -83,10 +83,11 @@
               │  (PostgreSQL + RLS)  │                     │
               │                      │                     │
               │  - sellers           │                     │
-              │  - marketplaces      │                     │
+              │  - seller_marketplaces│                    │
               │  - orders            │                     │
+              │  - order_items       │                     │
               │  - inventory         │                     │
-              │  - sales_aggregates  │                     │
+              │  - sales_reports     │                     │
               │  - products          │                     │
               │  - sync_logs         │                     │
               │  - sellers_public    │                     │
@@ -158,23 +159,23 @@ Resolves the SP-API endpoint automatically from marketplace_id (e.g., `A1F83G8C2
 Four independent workers cover the data set required for Amazon EC operations:
 - **orders sync**: Fetches orders for the past N hours via getOrders, upsert with onConflict
 - **inventory sync**: Fetches FBA inventory via getInventorySummaries
-- **sales sync**: Daily aggregates written to sales_aggregates
-- **products sync**: Updates product master via getCatalogItem
+- **sales-reports sync**: Daily report rows written to `sales_reports` (per seller / marketplace / report_date / sku)
+- **products sync**: Updates product master via searchCatalogItems
 
-All workers share `runMarketplaceBatch`, processing multiple marketplaces concurrently. `sync_logs` records per-marketplace rows + `job_run_id (uuid)` so partial failures are traceable. On failure, a synthetic failed row is inserted into sync_logs.
+All workers share `runMarketplaceBatch` (in `packages/pipeline/src/lib/sync-helpers.ts`), processing multiple marketplaces concurrently. `sync_logs` records per-marketplace rows + `job_run_id (uuid)` so partial failures are traceable. On failure, a synthetic failed row is inserted into sync_logs.
 
 ### 7. Sync Job Tracking (`sync_logs` table)
-`updated_at` (Amazon LastUpdateDate) and `synced_at` (pipeline execution timestamp) are stored in separate columns. By tracking the Amazon-side update timestamp independently from the pipeline-side sync timestamp, you can isolate whether a delay originates from Amazon or from the pipeline. `status` (`pending` / `running` / `success` / `failed`) and `error_message` provide complete execution visibility.
+Each batch run writes one `sync_logs` row per (seller, marketplace, job_type) — sharing a single `job_run_id` across the rows of one orchestrator run so partial failures are traceable. `status` is one of `started` / `succeeded` / `failed` / `partial`; `records_fetched`, `records_upserted`, `error_code`, and `error_message` give full execution visibility. The data tables themselves track `last_update_date` (Amazon-side) separately from `fetched_at` (pipeline-side) so a stalled sync is distinguishable from a quiet day on Amazon.
 
 ### 8. Cloudflare Workers Cron Schedules (`packages/cloudflare-worker/src/index.ts`)
 The `scheduled()` handler manages 4 cron schedules:
 
 | Worker | Cron | Frequency |
 |---|---|---|
-| orders sync | `0 */6 * * *` | Every 6 hours |
-| inventory sync | `0 */6 * * *` | Every 6 hours |
-| sales sync | `0 0 * * *` | Daily |
-| products sync | `0 0 * * 1` | Weekly (Monday) |
+| orders sync | `0 */6 * * *` | Every 6 hours, on the hour |
+| inventory sync | `15 */6 * * *` | Every 6 hours, offset +15 min (spreads load away from orders) |
+| sales-reports sync | `0 0 * * *` | Daily 00:00 UTC |
+| products sync | `0 0 * * 0` | Weekly, Sunday 00:00 UTC |
 
 Cloudflare Workers allows up to 5 cron schedules per Worker, and we keep it at 4 to leave headroom. The `packages/pipeline` is imported and reused directly. Node compatibility is enabled via the `nodejs_compat` flag.
 
@@ -189,70 +190,90 @@ Server Components fetch directly from Supabase and run on Edge Runtime (`export 
 A persistent top banner reading: **"Sandbox Demo — Connected to SP-API Sandbox endpoint. Production credentials require a separate engagement."**
 This makes the Sandbox-only constraint explicit while doubling as a bridge message toward production engagements — an Upwork-friendly framing.
 
-### 11. Supabase Keepalive (`.github/workflows/supabase-keepalive.yml`)
-Supabase Free Plan auto-pauses after 7 days of inactivity. A GitHub Actions workflow runs an effectively `SELECT 1` query every 3 days to prevent auto-pause — keeping the demo always-on at $0/month.
+### 11. Supabase Keepalive (`.github/workflows/keepalive.yml`)
+Supabase Free Plan auto-pauses after 7 days of inactivity. A GitHub Actions workflow issues a `SELECT id FROM sellers LIMIT 1` request via PostgREST every 3 days to prevent auto-pause — keeping the demo always-on at $0/month.
 
 ---
 
 ## Database Schema
 
 ```
-┌─────────────────────────────────────┐
-│            sellers                   │
-├─────────────────────────────────────┤
-│ id              UUID PK             │
-│ name            TEXT                │
-│ encrypted_creds TEXT                │ ← AES-256-GCM
-│ is_demo         BOOLEAN DEFAULT F   │
-│ created_at      TIMESTAMPTZ         │
-│ updated_at      TIMESTAMPTZ         │
-└─────────────┬───────────────────────┘
-              │ 1:N
-              ▼
-┌─────────────────────────────────────┐      ┌───────────────────────────┐
-│         marketplaces                │      │     sellers_public        │
-├─────────────────────────────────────┤      │  (VIEW, security_invoker) │
-│ id              UUID PK             │      ├───────────────────────────┤
-│ seller_id       UUID FK             │      │ SELECT id, name           │
-│ marketplace_id  TEXT (Amazon ID)    │      │ FROM sellers              │
-│ region          TEXT (NA/EU/FE)     │      │ WHERE is_demo = TRUE      │
-│ created_at      TIMESTAMPTZ         │      └───────────────────────────┘
-└─────────────┬───────────────────────┘
-              │ 1:N
-              ▼
-┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
-│       orders         │  │     inventory        │  │      products        │
-├──────────────────────┤  ├──────────────────────┤  ├──────────────────────┤
-│ id            UUID   │  │ id           UUID    │  │ id            UUID   │
-│ seller_id     UUID   │  │ seller_id    UUID    │  │ seller_id     UUID   │
-│ marketplace_  TEXT   │  │ marketplace_ TEXT    │  │ asin          TEXT   │
-│ amazon_order_ TEXT   │  │ asin         TEXT    │  │ title         TEXT   │
-│ status        TEXT   │  │ qty_total    INT     │  │ updated_at    TS     │
-│ updated_at    TS     │  │ updated_at   TS      │  │ synced_at     TS     │
-│ synced_at     TS     │  │ synced_at    TS      │  │                      │
-│ UNIQUE(seller, mp,   │  │ UNIQUE(seller, mp,   │  │ UNIQUE(seller, asin) │
-│        amazon_id)    │  │        asin)         │  │                      │
-└──────────────────────┘  └──────────────────────┘  └──────────────────────┘
+┌────────────────────────────────────────────────────┐
+│                     sellers                         │
+├────────────────────────────────────────────────────┤
+│ id                       UUID PK                    │
+│ owner_user_id            UUID  → auth.users         │
+│ display_name             TEXT                       │
+│ selling_partner_id       TEXT  UNIQUE               │
+│ region                   TEXT  CHECK in (na/eu/fe)  │
+│ refresh_token_encrypted  TEXT  ← AES-256-GCM        │
+│ encryption_key_version   SMALLINT (1, 2, …)         │
+│ is_active                BOOLEAN                    │
+│ is_demo                  BOOLEAN  (migration 0003)  │
+│ created_at, updated_at   TIMESTAMPTZ                │
+└─────────┬──────────────────────────────────────────┘
+          │ 1:N
+          ▼
+┌─────────────────────────────────────┐    ┌───────────────────────────────────┐
+│      seller_marketplaces            │    │           sellers_public          │
+├─────────────────────────────────────┤    │     (view, security_invoker)      │
+│ id                UUID PK           │    ├───────────────────────────────────┤
+│ seller_id         UUID FK           │    │ id, display_name,                 │
+│ marketplace_id    TEXT (Amazon ID)  │    │ selling_partner_id, region,       │
+│ country_code      CHAR(2)           │    │ is_active, is_demo,               │
+│ default_currency  CHAR(3)           │    │ created_at, updated_at            │
+│ is_enabled        BOOLEAN           │    │ FROM sellers WHERE is_demo = TRUE │
+│ UNIQUE(seller_id, marketplace_id)   │    │ → anon-readable; refresh_token_*  │
+└─────────────────────────────────────┘    │   columns are not exposed         │
+                                           └───────────────────────────────────┘
 
-┌──────────────────────┐  ┌─────────────────────────────────────────┐
-│  sales_aggregates    │  │              sync_logs                   │
-├──────────────────────┤  ├─────────────────────────────────────────┤
-│ id           UUID    │  │ id              UUID PK                 │
-│ seller_id    UUID    │  │ job_run_id      UUID (per batch)        │
-│ marketplace_ TEXT    │  │ seller_id       UUID FK                 │
-│ date         DATE    │  │ marketplace_id  TEXT                    │
-│ total_sales  NUMERIC │  │ worker          TEXT (orders/inv/...)   │
-│ order_count  INT     │  │ status          TEXT (pending/running/  │
-│ updated_at   TS      │  │                       success/failed)   │
-│ synced_at    TS      │  │ error_message   TEXT?                   │
-│ UNIQUE(seller, mp,   │  │ started_at      TIMESTAMPTZ             │
-│        date)         │  │ finished_at     TIMESTAMPTZ?            │
-└──────────────────────┘  └─────────────────────────────────────────┘
+┌────────────────────────────┐  ┌────────────────────────────┐  ┌────────────────────────────┐
+│          orders            │  │         inventory          │  │          products          │
+├────────────────────────────┤  ├────────────────────────────┤  ├────────────────────────────┤
+│ id, seller_id, marketplace │  │ id, seller_id, marketplace │  │ id, seller_id, marketplace │
+│ amazon_order_id            │  │ sku, asin                  │  │ sku, asin, title, brand    │
+│ purchase_date              │  │ fulfillable_quantity       │  │ list_price, currency       │
+│ last_update_date           │  │ inbound_working_quantity   │  │ image_url                  │
+│ order_status               │  │ inbound_shipped_quantity   │  │ status                     │
+│ fulfillment_channel        │  │ inbound_receiving_quantity │  │ raw (JSONB)                │
+│ order_total_amount/curr    │  │ reserved_quantity          │  │ fetched_at                 │
+│ items_shipped/unshipped    │  │ unfulfillable_quantity     │  │ created_at, updated_at     │
+│ buyer_email, ship_country  │  │ total_quantity             │  │ UNIQUE(seller_id,          │
+│ is_premium / is_business   │  │ raw (JSONB)                │  │        marketplace_id, sku)│
+│ raw (JSONB)                │  │ fetched_at                 │  └────────────────────────────┘
+│ fetched_at                 │  │ created_at, updated_at     │
+│ created_at, updated_at     │  │ UNIQUE(seller_id,          │  ┌────────────────────────────┐
+│ UNIQUE(marketplace_id,     │  │        marketplace_id, sku)│  │        order_items         │
+│        amazon_order_id)    │  └────────────────────────────┘  ├────────────────────────────┤
+└────────────────────────────┘                                  │ id, order_id (FK), seller  │
+                                                                │ order_item_id (Amazon)     │
+┌────────────────────────────┐  ┌─────────────────────────────┐ │ sku, asin, title           │
+│       sales_reports        │  │          sync_logs          │ │ quantity_ordered/shipped   │
+├────────────────────────────┤  ├─────────────────────────────┤ │ item_price_amount/curr     │
+│ id, seller_id, marketplace │  │ id, seller_id, marketplace  │ │ item_tax_amount            │
+│ report_date  DATE          │  │ job_run_id (UUID)           │ │ shipping_price_amount      │
+│ sku, asin                  │  │ job_type CHECK ∈            │ │ promotion_discount         │
+│ units_ordered, _refunded   │  │   (orders, inventory,       │ │ raw (JSONB)                │
+│ ordered_product_sales_*    │  │    sales_reports, products) │ │ UNIQUE(order_id,           │
+│ sessions, page_views       │  │ status CHECK ∈              │ │        order_item_id)      │
+│ buy_box_percentage         │  │   (started, succeeded,      │ └────────────────────────────┘
+│ raw (JSONB)                │  │    failed, partial)         │
+│ UNIQUE(seller_id,          │  │ started_at, finished_at     │
+│        marketplace_id,     │  │ records_fetched / upserted  │
+│        report_date, sku)   │  │ error_code, error_message   │
+└────────────────────────────┘  │ payload (JSONB)             │
+                                └─────────────────────────────┘
 
-Indexes: All tables have (seller_id, marketplace_id, updated_at DESC)
-RLS: sellers_public view is SELECT-able by anon role; everything else is service_role only
-upsert pattern: ON CONFLICT (seller_id, marketplace_id, <natural_key>) DO UPDATE
-                SET ..., synced_at = NOW()
+Migrations:
+  0001_initial_schema.sql       — base schema + RLS (owner_user_id-scoped)
+  0002_phase2_sync_columns.sql  — sync_logs.job_run_id + worker hooks
+  0003_phase5_demo_access.sql   — is_demo flag + sellers_public view + anon-read RLS
+  0004_phase5_anon_grant.sql    — table-level GRANT SELECT to anon (RLS still gates rows)
+
+RLS: every table has RLS enabled. service_role bypasses RLS (used by the cron pipeline).
+     authenticated reads are scoped to sellers.owner_user_id = auth.uid().
+     anon reads are scoped to is_demo = true (added in 0003).
+Upsert pattern: ON CONFLICT (<natural_key>) DO UPDATE; updated_at maintained by trigger.
 ```
 
 ---
@@ -260,17 +281,14 @@ upsert pattern: ON CONFLICT (seller_id, marketplace_id, <natural_key>) DO UPDATE
 ## Screen Specifications
 
 ### Sellers List (`/`)
-- Sandbox Demo banner (persistent, blue background with the Sandbox-only message)
-- Seller card list (fetched via the `sellers_public` view)
-- Each card: Seller name / latest sync summary (success/failure counts) / "Detail" link
-- "All-worker sync status" summary panel showing the latest status of orders / inventory / sales / products
+- Sandbox Demo banner pinned at the top (amber background) explaining the Sandbox-only stance and leaving a bridge to a paid production engagement.
+- Seller card grid (one card per demo seller, fetched via the `sellers_public` view).
+- Each card: display name, masked selling-partner ID, region, marketplace flag chips, recent-runs / succeeded / failed counts, and the latest run summary with a `details →` link.
 
 ### Seller Detail (`/sellers/[sellerId]`)
-- Seller name + marketplace list (NA / EU / FE badges)
-- Recent sync_logs table (per marketplace, per worker, color-coded by status)
-- Latest orders snapshot (last 10, with status badges)
-- Latest inventory snapshot (asin / qty_total)
-- Latest sales aggregates (last 7 days summary)
+- Header: display name, masked selling-partner ID, region, active/inactive badge.
+- "Marketplaces · latest sync per job" table — for each marketplace the seller has enabled, the most recent log per `job_type` (orders / inventory / sales_reports / products) is rendered with a status badge, relative time, row counts, and duration.
+- "Recent orchestrator runs" — the last 5 runs grouped by `job_run_id`, each listing the per-job rows (badge, job, marketplace, rows, duration, optional error code).
 
 ---
 
@@ -281,9 +299,9 @@ upsert pattern: ON CONFLICT (seller_id, marketplace_id, <natural_key>) DO UPDATE
 | GET | `/` | Edge | Public (demo) | Sellers list page (Server Component fetch) |
 | GET | `/sellers/[sellerId]` | Edge | Public (demo) | Seller detail page (Server Component fetch) |
 | Cron | `0 */6 * * *` | Workers | Internal | Triggers orders sync |
-| Cron | `0 */6 * * *` | Workers | Internal | Triggers inventory sync |
-| Cron | `0 0 * * *` | Workers | Internal | Triggers sales sync |
-| Cron | `0 0 * * 1` | Workers | Internal | Triggers products sync |
+| Cron | `15 */6 * * *` | Workers | Internal | Triggers inventory sync (offset +15 min) |
+| Cron | `0 0 * * *` | Workers | Internal | Triggers sales-reports sync (daily) |
+| Cron | `0 0 * * 0` | Workers | Internal | Triggers products sync (weekly, Sunday) |
 
 > The project is Server Components-centric, so API Routes are minimized. Data retrieval happens via direct Supabase fetches gated by RLS.
 
@@ -306,21 +324,21 @@ amazon-pulse/                              monorepo (npm workspaces)
 │   ├── pipeline/                          4,108 LOC
 │   │   ├── src/
 │   │   │   ├── lib/
-│   │   │   │   ├── encryption.ts          AES-256-GCM encryption
-│   │   │   │   ├── lwa-auth.ts            LWA OAuth refresh flow
-│   │   │   │   ├── sp-api-client.ts       SP-API HTTP client
-│   │   │   │   ├── supabase-client.ts     Supabase connection management
-│   │   │   │   ├── token-bucket.ts        Token Bucket rate limiter
-│   │   │   │   ├── rate-limits.ts         operation-level rate config
-│   │   │   │   ├── sp-api-endpoints.ts    region routing
-│   │   │   │   └── schemas/               zod schemas (Swagger-aligned)
+│   │   │   │   ├── encryption.ts            AES-256-GCM encryption
+│   │   │   │   ├── lwa-auth.ts              LWA OAuth refresh flow
+│   │   │   │   ├── sp-api-client.ts         SP-API HTTP client
+│   │   │   │   ├── supabase-client.ts       Supabase connection management
+│   │   │   │   ├── token-bucket.ts          Token Bucket rate limiter
+│   │   │   │   ├── rate-limits.ts           operation-level rate config
+│   │   │   │   ├── sp-api-endpoints.ts      region routing
+│   │   │   │   └── sync-helpers.ts          runMarketplaceBatch + sync_logs writer
+│   │   │   ├── schemas/                     zod schemas (Swagger-aligned)
 │   │   │   └── workers/
-│   │   │       ├── sync-orders.ts         orders sync worker
-│   │   │       ├── sync-inventory.ts      inventory sync worker
-│   │   │       ├── sync-sales.ts          sales sync worker
-│   │   │       ├── sync-products.ts       products sync worker
-│   │   │       └── sync-helpers.ts        runMarketplaceBatch
-│   │   └── tests/                         55 tests (FakeSupabase + URL fix)
+│   │   │       ├── sync-orders.ts           orders sync worker
+│   │   │       ├── sync-inventory.ts        inventory sync worker
+│   │   │       ├── sync-sales-reports.ts    sales-reports sync worker
+│   │   │       └── sync-products.ts         products sync worker
+│   │   └── tests/                           55 tests (FakeSupabase + URL fix)
 │   │
 │   ├── frontend/                          1,118 LOC
 │   │   ├── app/
@@ -341,15 +359,17 @@ amazon-pulse/                              monorepo (npm workspaces)
 │
 ├── infrastructure/
 │   └── supabase/
-│       └── migrations/
-│           ├── 0001_init.sql              Schema initialization
-│           ├── 0002_sync_logs.sql         sync_logs + indexes
-│           └── 0003_demo_view.sql         is_demo + sellers_public view
+│       ├── migrations/
+│       │   ├── 0001_initial_schema.sql      base schema + RLS
+│       │   ├── 0002_phase2_sync_columns.sql sync_logs.job_run_id + indexes
+│       │   ├── 0003_phase5_demo_access.sql  is_demo flag + sellers_public view
+│       │   └── 0004_phase5_anon_grant.sql   table-level GRANT SELECT to anon
+│       └── seed.sql                         synthetic demo dataset
 │
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                         Tests + NG word grep
-│       └── supabase-keepalive.yml         Auto-pause prevention every 3 days
+│       ├── ci.yml                         typecheck + tests on push/PR
+│       └── keepalive.yml                  Supabase REST ping every 3 days
 │
 ├── package.json                           workspaces definition
 ├── tsconfig.json                          strict + noUncheckedIndexedAccess
@@ -377,10 +397,12 @@ cd amazon-pulse
 # Install dependencies
 npm install
 
-# Apply Supabase migrations
-psql "$SUPABASE_URL" < infrastructure/supabase/migrations/0001_init.sql
-psql "$SUPABASE_URL" < infrastructure/supabase/migrations/0002_sync_logs.sql
-psql "$SUPABASE_URL" < infrastructure/supabase/migrations/0003_demo_view.sql
+# Apply Supabase migrations (in order)
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0001_initial_schema.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0002_phase2_sync_columns.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0003_phase5_demo_access.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0004_phase5_anon_grant.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/seed.sql
 
 # Encrypt your Sandbox app credentials and register them in Supabase
 # (See README for details)
@@ -403,8 +425,8 @@ npx wrangler deploy
 | `NEXT_PUBLIC_SUPABASE_URL` | Same URL (frontend Edge Runtime) | Yes |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon key (frontend) | Yes |
 | `ENCRYPTION_KEY` | 32-byte AES-256-GCM master key (base64) | Yes |
-| `LWA_CLIENT_ID` | LWA app client ID | Yes |
-| `LWA_CLIENT_SECRET` | LWA app client secret | Yes |
+| `SP_API_CLIENT_ID` | LWA app client ID (used by SP-API) | Yes |
+| `SP_API_CLIENT_SECRET` | LWA app client secret (used by SP-API) | Yes |
 
 ### Cloudflare Pages Settings
 

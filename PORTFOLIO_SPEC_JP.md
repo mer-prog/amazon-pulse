@@ -83,10 +83,11 @@
               │  (PostgreSQL + RLS)  │                     │
               │                      │                     │
               │  - sellers           │                     │
-              │  - marketplaces      │                     │
+              │  - seller_marketplaces│                    │
               │  - orders            │                     │
+              │  - order_items       │                     │
               │  - inventory         │                     │
-              │  - sales_aggregates  │                     │
+              │  - sales_reports     │                     │
               │  - products          │                     │
               │  - sync_logs         │                     │
               │  - sellers_public    │                     │
@@ -158,23 +159,23 @@ marketplace_id (例: `A1F83G8C2ARO7P` = UK = EU region) から自動的に SP-AP
 Amazon EC 運営に必要な 4 種データを独立 worker として実装:
 - **orders sync**: getOrders で過去 N 時間の注文を取得、upsert with onConflict
 - **inventory sync**: getInventorySummaries で FBA 在庫を取得
-- **sales sync**: 日次集計を sales_aggregates に書き込み
-- **products sync**: getCatalogItem で商品マスタを更新
+- **sales-reports sync**: 日次レポート行を `sales_reports`(seller × marketplace × report_date × sku 粒度)に upsert
+- **products sync**: searchCatalogItems で商品マスタを更新
 
-各 worker は `runMarketplaceBatch` 関数を共通で使用し、複数 marketplace を並列処理。`sync_logs` に marketplace 単位で N 行記録 + `job_run_id (uuid)` で部分失敗を追跡可能。失敗時は synthetic failed row を sync_logs に挿入。
+各 worker は `runMarketplaceBatch` 関数(`packages/pipeline/src/lib/sync-helpers.ts`)を共通で使用し、複数 marketplace を並列処理。`sync_logs` に marketplace 単位で N 行記録 + `job_run_id (uuid)` で部分失敗を追跡可能。失敗時は synthetic failed row を sync_logs に挿入。
 
 ### 7. Sync Job Tracking(`sync_logs` table)
-`updated_at` (Amazon LastUpdateDate) と `synced_at` (pipeline 実行時刻) を別カラムで分離保存。Amazon 側の更新時刻と pipeline 側の同期時刻を独立追跡できることで、どちら起因の遅延かを切り分け可能。`status` (`pending` / `running` / `success` / `failed`) と `error_message` で実行状況を完全可視化。
+1 batch 実行ごとに (seller, marketplace, job_type) 単位で 1 行を挿入し、同一 orchestrator run 内の行は同じ `job_run_id` を共有。これにより部分失敗が可視化される。`status` は `started` / `succeeded` / `failed` / `partial` の 4 値。`records_fetched` / `records_upserted` / `error_code` / `error_message` で実行状況を完全可視化。データテーブル側では Amazon 由来の `last_update_date` と pipeline 側の `fetched_at` を別カラムに保持しているため、「Amazon 側の停滞」と「pipeline 側の停止」を切り分けられる。
 
 ### 8. Cloudflare Workers Cron Schedules(`packages/cloudflare-worker/src/index.ts`)
 `scheduled()` handler で 4 種の cron を管理:
 
 | Worker | Cron | 頻度 |
 |---|---|---|
-| orders sync | `0 */6 * * *` | 6時間ごと |
-| inventory sync | `0 */6 * * *` | 6時間ごと |
-| sales sync | `0 0 * * *` | 日次 |
-| products sync | `0 0 * * 1` | 週次(月曜) |
+| orders sync | `0 */6 * * *` | 6 時間ごと、毎正時 |
+| inventory sync | `15 */6 * * *` | 6 時間ごと、+15 分オフセット(orders と負荷分散) |
+| sales-reports sync | `0 0 * * *` | 日次 00:00 UTC |
+| products sync | `0 0 * * 0` | 週次、日曜 00:00 UTC |
 
 Cloudflare Workers Cron は同 Worker 内で 5 個まで設定可能で、4 個に収めることで余裕を確保。`packages/pipeline` を直接 import して再利用、`nodejs_compat` flag で Node 標準ライブラリ互換。
 
@@ -189,70 +190,90 @@ Server Components で Supabase から直接 fetch し、Edge Runtime (`export co
 全ページ上部に常駐バナー: **"Sandbox Demo — Connected to SP-API Sandbox endpoint. Production credentials require a separate engagement."**
 寸止め原則を明示しつつ、Production engagement への橋渡しメッセージを兼ねる Upwork 訴求設計。
 
-### 11. Supabase Keepalive(`.github/workflows/supabase-keepalive.yml`)
-Supabase Free Plan は 7 日間 inactive で auto-pause される。GitHub Actions で 3 日おきに `SELECT 1` 相当の query を投げ、auto-pause を回避。寸止め原則($0/月)を維持しつつ、デモを常時稼働させる仕組み。
+### 11. Supabase Keepalive(`.github/workflows/keepalive.yml`)
+Supabase Free Plan は 7 日間 inactive で auto-pause される。GitHub Actions で 3 日おきに PostgREST 経由の `SELECT id FROM sellers LIMIT 1` を発行して auto-pause を回避。寸止め原則($0/月)を維持しつつ、デモを常時稼働させる仕組み。
 
 ---
 
 ## データベース設計
 
 ```
-┌─────────────────────────────────────┐
-│            sellers                   │
-├─────────────────────────────────────┤
-│ id              UUID PK             │
-│ name            TEXT                │
-│ encrypted_creds TEXT                │ ← AES-256-GCM
-│ is_demo         BOOLEAN DEFAULT F   │
-│ created_at      TIMESTAMPTZ         │
-│ updated_at      TIMESTAMPTZ         │
-└─────────────┬───────────────────────┘
-              │ 1:N
-              ▼
-┌─────────────────────────────────────┐      ┌───────────────────────────┐
-│         marketplaces                │      │     sellers_public        │
-├─────────────────────────────────────┤      │  (VIEW, security_invoker) │
-│ id              UUID PK             │      ├───────────────────────────┤
-│ seller_id       UUID FK             │      │ SELECT id, name           │
-│ marketplace_id  TEXT (Amazon ID)    │      │ FROM sellers              │
-│ region          TEXT (NA/EU/FE)     │      │ WHERE is_demo = TRUE      │
-│ created_at      TIMESTAMPTZ         │      └───────────────────────────┘
-└─────────────┬───────────────────────┘
-              │ 1:N
-              ▼
-┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
-│       orders         │  │     inventory        │  │      products        │
-├──────────────────────┤  ├──────────────────────┤  ├──────────────────────┤
-│ id            UUID   │  │ id           UUID    │  │ id            UUID   │
-│ seller_id     UUID   │  │ seller_id    UUID    │  │ seller_id     UUID   │
-│ marketplace_  TEXT   │  │ marketplace_ TEXT    │  │ asin          TEXT   │
-│ amazon_order_ TEXT   │  │ asin         TEXT    │  │ title         TEXT   │
-│ status        TEXT   │  │ qty_total    INT     │  │ updated_at    TS     │
-│ updated_at    TS     │  │ updated_at   TS      │  │ synced_at     TS     │
-│ synced_at     TS     │  │ synced_at    TS      │  │                      │
-│ UNIQUE(seller, mp,   │  │ UNIQUE(seller, mp,   │  │ UNIQUE(seller, asin) │
-│        amazon_id)    │  │        asin)         │  │                      │
-└──────────────────────┘  └──────────────────────┘  └──────────────────────┘
+┌────────────────────────────────────────────────────┐
+│                     sellers                         │
+├────────────────────────────────────────────────────┤
+│ id                       UUID PK                    │
+│ owner_user_id            UUID  → auth.users         │
+│ display_name             TEXT                       │
+│ selling_partner_id       TEXT  UNIQUE               │
+│ region                   TEXT  CHECK in (na/eu/fe)  │
+│ refresh_token_encrypted  TEXT  ← AES-256-GCM        │
+│ encryption_key_version   SMALLINT (1, 2, …)         │
+│ is_active                BOOLEAN                    │
+│ is_demo                  BOOLEAN  (migration 0003)  │
+│ created_at, updated_at   TIMESTAMPTZ                │
+└─────────┬──────────────────────────────────────────┘
+          │ 1:N
+          ▼
+┌─────────────────────────────────────┐    ┌───────────────────────────────────┐
+│      seller_marketplaces            │    │           sellers_public          │
+├─────────────────────────────────────┤    │     (view, security_invoker)      │
+│ id                UUID PK           │    ├───────────────────────────────────┤
+│ seller_id         UUID FK           │    │ id, display_name,                 │
+│ marketplace_id    TEXT (Amazon ID)  │    │ selling_partner_id, region,       │
+│ country_code      CHAR(2)           │    │ is_active, is_demo,               │
+│ default_currency  CHAR(3)           │    │ created_at, updated_at            │
+│ is_enabled        BOOLEAN           │    │ FROM sellers WHERE is_demo = TRUE │
+│ UNIQUE(seller_id, marketplace_id)   │    │ → anon-readable; refresh_token_*  │
+└─────────────────────────────────────┘    │   カラムは公開しない              │
+                                           └───────────────────────────────────┘
 
-┌──────────────────────┐  ┌─────────────────────────────────────────┐
-│  sales_aggregates    │  │              sync_logs                   │
-├──────────────────────┤  ├─────────────────────────────────────────┤
-│ id           UUID    │  │ id              UUID PK                 │
-│ seller_id    UUID    │  │ job_run_id      UUID (per batch)        │
-│ marketplace_ TEXT    │  │ seller_id       UUID FK                 │
-│ date         DATE    │  │ marketplace_id  TEXT                    │
-│ total_sales  NUMERIC │  │ worker          TEXT (orders/inv/...)   │
-│ order_count  INT     │  │ status          TEXT (pending/running/  │
-│ updated_at   TS      │  │                       success/failed)   │
-│ synced_at    TS      │  │ error_message   TEXT?                   │
-│ UNIQUE(seller, mp,   │  │ started_at      TIMESTAMPTZ             │
-│        date)         │  │ finished_at     TIMESTAMPTZ?            │
-└──────────────────────┘  └─────────────────────────────────────────┘
+┌────────────────────────────┐  ┌────────────────────────────┐  ┌────────────────────────────┐
+│          orders            │  │         inventory          │  │          products          │
+├────────────────────────────┤  ├────────────────────────────┤  ├────────────────────────────┤
+│ id, seller_id, marketplace │  │ id, seller_id, marketplace │  │ id, seller_id, marketplace │
+│ amazon_order_id            │  │ sku, asin                  │  │ sku, asin, title, brand    │
+│ purchase_date              │  │ fulfillable_quantity       │  │ list_price, currency       │
+│ last_update_date           │  │ inbound_working_quantity   │  │ image_url                  │
+│ order_status               │  │ inbound_shipped_quantity   │  │ status                     │
+│ fulfillment_channel        │  │ inbound_receiving_quantity │  │ raw (JSONB)                │
+│ order_total_amount/curr    │  │ reserved_quantity          │  │ fetched_at                 │
+│ items_shipped/unshipped    │  │ unfulfillable_quantity     │  │ created_at, updated_at     │
+│ buyer_email, ship_country  │  │ total_quantity             │  │ UNIQUE(seller_id,          │
+│ is_premium / is_business   │  │ raw (JSONB)                │  │        marketplace_id, sku)│
+│ raw (JSONB)                │  │ fetched_at                 │  └────────────────────────────┘
+│ fetched_at                 │  │ created_at, updated_at     │
+│ created_at, updated_at     │  │ UNIQUE(seller_id,          │  ┌────────────────────────────┐
+│ UNIQUE(marketplace_id,     │  │        marketplace_id, sku)│  │        order_items         │
+│        amazon_order_id)    │  └────────────────────────────┘  ├────────────────────────────┤
+└────────────────────────────┘                                  │ id, order_id (FK), seller  │
+                                                                │ order_item_id (Amazon)     │
+┌────────────────────────────┐  ┌─────────────────────────────┐ │ sku, asin, title           │
+│       sales_reports        │  │          sync_logs          │ │ quantity_ordered/shipped   │
+├────────────────────────────┤  ├─────────────────────────────┤ │ item_price_amount/curr     │
+│ id, seller_id, marketplace │  │ id, seller_id, marketplace  │ │ item_tax_amount            │
+│ report_date  DATE          │  │ job_run_id (UUID)           │ │ shipping_price_amount      │
+│ sku, asin                  │  │ job_type CHECK ∈            │ │ promotion_discount         │
+│ units_ordered, _refunded   │  │   (orders, inventory,       │ │ raw (JSONB)                │
+│ ordered_product_sales_*    │  │    sales_reports, products) │ │ UNIQUE(order_id,           │
+│ sessions, page_views       │  │ status CHECK ∈              │ │        order_item_id)      │
+│ buy_box_percentage         │  │   (started, succeeded,      │ └────────────────────────────┘
+│ raw (JSONB)                │  │    failed, partial)         │
+│ UNIQUE(seller_id,          │  │ started_at, finished_at     │
+│        marketplace_id,     │  │ records_fetched / upserted  │
+│        report_date, sku)   │  │ error_code, error_message   │
+└────────────────────────────┘  │ payload (JSONB)             │
+                                └─────────────────────────────┘
 
-インデックス: 全テーブルに (seller_id, marketplace_id, updated_at DESC)
-RLS: sellers_public view は anon role で SELECT 可、それ以外は service_role 限定
-upsert pattern: ON CONFLICT (seller_id, marketplace_id, <natural_key>) DO UPDATE
-                SET ..., synced_at = NOW()
+Migrations:
+  0001_initial_schema.sql       — base schema + RLS (owner_user_id-scoped)
+  0002_phase2_sync_columns.sql  — sync_logs.job_run_id + worker hooks
+  0003_phase5_demo_access.sql   — is_demo flag + sellers_public view + anon-read RLS
+  0004_phase5_anon_grant.sql    — table-level GRANT SELECT to anon (RLS は引き続き行を絞る)
+
+RLS: 全テーブルで RLS 有効。service_role は RLS bypass(cron pipeline で使用)。
+     authenticated 読みは sellers.owner_user_id = auth.uid() で seller 単位に scoped。
+     anon 読みは is_demo = true で demo seller に scoped(0003 で追加)。
+upsert pattern: ON CONFLICT (<natural_key>) DO UPDATE。updated_at は trigger で自動更新。
 ```
 
 ---
@@ -260,17 +281,14 @@ upsert pattern: ON CONFLICT (seller_id, marketplace_id, <natural_key>) DO UPDATE
 ## 画面仕様
 
 ### Sellers 一覧 (`/`)
-- Sandbox Demo バナー(常駐、青背景 + 寸止め文言)
-- Seller カード一覧(`sellers_public` view から fetch)
-- 各カード: Seller name / 最新 sync 状況サマリ(成功/失敗カウント) / 「詳細」リンク
-- 「全 worker の sync 状況」サマリパネル(orders/inventory/sales/products の最新 status)
+- ページ最上部に Sandbox Demo バナーを常駐(amber 背景)。Sandbox-only である旨と Production engagement への橋渡しを明示。
+- Demo seller の card grid(`sellers_public` view から fetch)。
+- 各カード: display name、masked selling-partner ID、region、marketplace の国旗 chip、recent runs / succeeded / failed カウント、最新 run のサマリと `details →` リンク。
 
 ### Seller 詳細 (`/sellers/[sellerId]`)
-- Seller name + marketplace 一覧(NA / EU / FE バッジ)
-- 最近の sync_logs テーブル(marketplace 別、worker 別、status 色分け)
-- 最新 orders snapshot(直近 10 件、status 別バッジ)
-- 最新 inventory snapshot(asin / qty_total)
-- 最新 sales aggregates(直近 7 日のサマリ)
+- ヘッダ: display name、masked selling-partner ID、region、active/inactive バッジ。
+- 「Marketplaces · latest sync per job」テーブル: 当該 seller が enabled にしている marketplace について、`job_type`(orders / inventory / sales_reports / products)ごとの最新 log を、status badge / relative time / 行数 / duration で表示。
+- 「Recent orchestrator runs」: 直近 5 run を `job_run_id` で grouping し、各 run の per-job 行(badge / job / marketplace / 行数 / duration / 任意の error code)を一覧表示。
 
 ---
 
@@ -281,9 +299,9 @@ upsert pattern: ON CONFLICT (seller_id, marketplace_id, <natural_key>) DO UPDATE
 | GET | `/` | Edge | Public(demo) | Sellers 一覧ページ(Server Component fetch) |
 | GET | `/sellers/[sellerId]` | Edge | Public(demo) | Seller 詳細ページ(Server Component fetch) |
 | Cron | `0 */6 * * *` | Workers | Internal | orders sync trigger |
-| Cron | `0 */6 * * *` | Workers | Internal | inventory sync trigger |
-| Cron | `0 0 * * *` | Workers | Internal | sales sync trigger |
-| Cron | `0 0 * * 1` | Workers | Internal | products sync trigger |
+| Cron | `15 */6 * * *` | Workers | Internal | inventory sync trigger(+15 分オフセット) |
+| Cron | `0 0 * * *` | Workers | Internal | sales-reports sync trigger(日次) |
+| Cron | `0 0 * * 0` | Workers | Internal | products sync trigger(週次、日曜) |
 
 > 本プロジェクトは Server Components 中心の設計のため、API Routes は最小化。データ取得は Supabase からの直接 fetch + RLS で完結。
 
@@ -306,21 +324,21 @@ amazon-pulse/                              monorepo (npm workspaces)
 │   ├── pipeline/                          4,108 LOC
 │   │   ├── src/
 │   │   │   ├── lib/
-│   │   │   │   ├── encryption.ts          AES-256-GCM 暗号化
-│   │   │   │   ├── lwa-auth.ts            LWA OAuth refresh flow
-│   │   │   │   ├── sp-api-client.ts       SP-API HTTP client
-│   │   │   │   ├── supabase-client.ts     Supabase 接続管理
-│   │   │   │   ├── token-bucket.ts        Token Bucket rate limiter
-│   │   │   │   ├── rate-limits.ts         operation-level rate config
-│   │   │   │   ├── sp-api-endpoints.ts    region routing
-│   │   │   │   └── schemas/               zod schema (Swagger 準拠)
+│   │   │   │   ├── encryption.ts            AES-256-GCM 暗号化
+│   │   │   │   ├── lwa-auth.ts              LWA OAuth refresh flow
+│   │   │   │   ├── sp-api-client.ts         SP-API HTTP client
+│   │   │   │   ├── supabase-client.ts       Supabase 接続管理
+│   │   │   │   ├── token-bucket.ts          Token Bucket rate limiter
+│   │   │   │   ├── rate-limits.ts           operation-level rate config
+│   │   │   │   ├── sp-api-endpoints.ts      region routing
+│   │   │   │   └── sync-helpers.ts          runMarketplaceBatch + sync_logs writer
+│   │   │   ├── schemas/                     zod schema (Swagger 準拠)
 │   │   │   └── workers/
-│   │   │       ├── sync-orders.ts         orders sync worker
-│   │   │       ├── sync-inventory.ts      inventory sync worker
-│   │   │       ├── sync-sales.ts          sales sync worker
-│   │   │       ├── sync-products.ts       products sync worker
-│   │   │       └── sync-helpers.ts        runMarketplaceBatch
-│   │   └── tests/                         55 tests (FakeSupabase + URL fix)
+│   │   │       ├── sync-orders.ts           orders sync worker
+│   │   │       ├── sync-inventory.ts        inventory sync worker
+│   │   │       ├── sync-sales-reports.ts    sales-reports sync worker
+│   │   │       └── sync-products.ts         products sync worker
+│   │   └── tests/                           55 tests (FakeSupabase + URL fix)
 │   │
 │   ├── frontend/                          1,118 LOC
 │   │   ├── app/
@@ -341,15 +359,17 @@ amazon-pulse/                              monorepo (npm workspaces)
 │
 ├── infrastructure/
 │   └── supabase/
-│       └── migrations/
-│           ├── 0001_init.sql              schema 初期化
-│           ├── 0002_sync_logs.sql         sync_logs + 索引
-│           └── 0003_demo_view.sql         is_demo + sellers_public view
+│       ├── migrations/
+│       │   ├── 0001_initial_schema.sql      base schema + RLS
+│       │   ├── 0002_phase2_sync_columns.sql sync_logs.job_run_id + 索引
+│       │   ├── 0003_phase5_demo_access.sql  is_demo flag + sellers_public view
+│       │   └── 0004_phase5_anon_grant.sql   table-level GRANT SELECT to anon
+│       └── seed.sql                         合成 demo データセット
 │
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                         tests + NG word grep
-│       └── supabase-keepalive.yml         3日おき auto-pause 回避
+│       ├── ci.yml                         push/PR で typecheck + tests
+│       └── keepalive.yml                  Supabase へ REST ping を 3 日おき
 │
 ├── package.json                           workspaces 定義
 ├── tsconfig.json                          strict + noUncheckedIndexedAccess
@@ -377,10 +397,12 @@ cd amazon-pulse
 # 依存関係のインストール
 npm install
 
-# Supabase migrations 適用
-psql "$SUPABASE_URL" < infrastructure/supabase/migrations/0001_init.sql
-psql "$SUPABASE_URL" < infrastructure/supabase/migrations/0002_sync_logs.sql
-psql "$SUPABASE_URL" < infrastructure/supabase/migrations/0003_demo_view.sql
+# Supabase migrations 適用(順序固定)
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0001_initial_schema.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0002_phase2_sync_columns.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0003_phase5_demo_access.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0004_phase5_anon_grant.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/seed.sql
 
 # Sandbox app credentials を暗号化して Supabase に登録
 # (詳細は README 参照)
@@ -403,8 +425,8 @@ npx wrangler deploy
 | `NEXT_PUBLIC_SUPABASE_URL` | 同 URL(frontend Edge Runtime 用) | はい |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon key (frontend 用) | はい |
 | `ENCRYPTION_KEY` | 32 byte の AES-256-GCM master key (base64) | はい |
-| `LWA_CLIENT_ID` | LWA app client ID | はい |
-| `LWA_CLIENT_SECRET` | LWA app client secret | はい |
+| `SP_API_CLIENT_ID` | LWA app client ID(SP-API で使用) | はい |
+| `SP_API_CLIENT_SECRET` | LWA app client secret(SP-API で使用) | はい |
 
 ### Cloudflare Pages 設定
 
