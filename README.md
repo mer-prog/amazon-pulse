@@ -53,7 +53,7 @@ flowchart LR
   end
 
   subgraph "Cloudflare Pages"
-    UI["Next.js 14 dashboard\n(read-only, anon key)"]
+    UI["Next.js 15 dashboard\n(read-only, anon key)"]
   end
 
   CRON --> HANDLERS --> BATCH --> CLIENT --> SPAPI
@@ -76,7 +76,7 @@ flowchart LR
 | HTTP         | axios + axios-retry |
 | Rate limiting| token bucket per `(operation, region)` (see `packages/pipeline/src/lib/`) |
 | Validation   | zod |
-| Frontend     | Next.js 14 App Router + Tailwind |
+| Frontend     | Next.js 15 App Router + Tailwind |
 | Tests        | Vitest (99 unit tests + 1 sandbox integration) |
 
 ## Key features
@@ -91,9 +91,7 @@ flowchart LR
 
 ## Demo
 
-Live demo: _(to be filled in once Cloudflare Pages deploy is wired — see "Deployment" below)_
-
-The dashboard reads from a small synthetic dataset (`infrastructure/supabase/seed.sql`) covering two demo sellers across DE / FR / IT / UK marketplaces.
+The live demo (linked at the top of this README) reads from a small synthetic dataset (`infrastructure/supabase/seed.sql`) covering two demo sellers across DE / FR / IT / UK marketplaces.
 
 ## Repository layout
 
@@ -122,7 +120,8 @@ packages/
     tests/                  24 tests
 infrastructure/
   supabase/
-    migrations/             0001 initial · 0002 sync columns · 0003 demo RLS
+    migrations/             0001 initial · 0002 sync columns · 0003 demo RLS ·
+                            0004 anon GRANT
     seed.sql                synthetic demo data
 .github/
   workflows/                ci.yml · keepalive.yml
@@ -142,6 +141,7 @@ cp packages/frontend/.env.example packages/frontend/.env.local
 psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0001_initial_schema.sql
 psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0002_phase2_sync_columns.sql
 psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0003_phase5_demo_access.sql
+psql "$SUPABASE_DB_URL" -f infrastructure/supabase/migrations/0004_phase5_anon_grant.sql
 psql "$SUPABASE_DB_URL" -f infrastructure/supabase/seed.sql
 
 # 4. Run tests + typecheck
@@ -161,15 +161,18 @@ The simplest path (no GitHub Actions secret needed): connect this repository in 
 | Setting | Value |
 |---|---|
 | Framework preset | Next.js |
-| Build command | `npm run build --workspace @amazon-pulse/frontend` |
-| Build output | `packages/frontend/.next` |
+| Build command | `npm run build:cf --workspace=@amazon-pulse/frontend` |
+| Build output | `packages/frontend/.vercel/output/static` |
 | Root directory | _(repository root)_ |
 | Node version | `20` |
+| Compatibility flags | `nodejs_compat` (Production + Preview) |
 | Env vars | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` |
+
+The build runs through the `@cloudflare/next-on-pages` adapter so Server Components run on the Cloudflare Pages edge runtime; deploying the raw `.next` directory will not work.
 
 The anon key is **safe** to ship to the browser: every demo-readable table has a `is_demo = true` policy (see `infrastructure/supabase/migrations/0003_phase5_demo_access.sql`).
 
-Alternatively, if you prefer GitHub Actions, push a workflow that runs `wrangler pages deploy packages/frontend/.next` after `npm run build` and stores `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` in repository secrets.
+Alternatively, if you prefer GitHub Actions, push a workflow that runs `wrangler pages deploy packages/frontend/.vercel/output/static` after `npm run build:cf` and stores `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` in repository secrets.
 
 ### Cron → Cloudflare Workers
 
