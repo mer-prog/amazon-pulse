@@ -12,18 +12,20 @@ import { Badge } from '../../../components/ui/Badge';
 import { SyncStatusBadge } from '../../../components/SyncStatusBadge';
 import { formatDuration, formatRelativeTime, maskSellingPartnerId } from '../../../lib/format';
 
+export const runtime = 'edge';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 interface PageProps {
-  params: { sellerId: string };
+  params: Promise<{ sellerId: string }>;
 }
 
 export default async function SellerDetailPage({ params }: PageProps) {
+  const { sellerId } = await params;
   const client = createDemoClient();
 
   const sellers = await listDemoSellers(client);
-  const seller = sellers.find((s) => s.id === params.sellerId);
+  const seller = sellers.find((s) => s.id === sellerId);
   if (!seller) {
     notFound();
   }
