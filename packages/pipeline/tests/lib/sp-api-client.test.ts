@@ -288,6 +288,89 @@ describe('SpApiClient — executeWithRateLimit', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('routes baseURL by `region` when set, defaulting to the EU sandbox host', async () => {
+    const seen: string[] = [];
+    const adapter: AxiosAdapter = async (config) => {
+      seen.push(String(config.baseURL ?? ''));
+      return ok(config, ORDERS_PAYLOAD);
+    };
+
+    const eu = new SpApiClient({
+      cacheKey: 'seller-eu',
+      refreshToken: 'rt',
+      credentials: CREDENTIALS,
+      httpAdapter: adapter,
+      region: 'eu',
+    });
+    const na = new SpApiClient({
+      cacheKey: 'seller-na',
+      refreshToken: 'rt',
+      credentials: CREDENTIALS,
+      httpAdapter: adapter,
+      region: 'na',
+    });
+
+    await eu.getOrders({ marketplaceIds: ['A1F83G8C2ARO7P'], createdAfter: '2026-01-01' });
+    await na.getOrders({ marketplaceIds: ['ATVPDKIKX0DER'], createdAfter: '2026-01-01' });
+
+    expect(seen[0]).toBe('https://sandbox.sellingpartnerapi-eu.amazon.com');
+    expect(seen[1]).toBe('https://sandbox.sellingpartnerapi-na.amazon.com');
+  });
+
+  it('explicit `endpoint` wins over `region` for the baseURL', async () => {
+    const seen: string[] = [];
+    const adapter: AxiosAdapter = async (config) => {
+      seen.push(String(config.baseURL ?? ''));
+      return ok(config, ORDERS_PAYLOAD);
+    };
+    const client = new SpApiClient({
+      cacheKey: 'seller-1',
+      refreshToken: 'rt',
+      credentials: CREDENTIALS,
+      httpAdapter: adapter,
+      region: 'eu',
+      endpoint: 'https://example.test/sp-api',
+    });
+    await client.getOrders({ marketplaceIds: ['A1F83G8C2ARO7P'], createdAfter: '2026-01-01' });
+    expect(seen[0]).toBe('https://example.test/sp-api');
+  });
+
+  it('uses independent rate-limit buckets per region (eu vs na do not block each other)', async () => {
+    // Each client has burst=1. If buckets were shared by operation only,
+    // back-to-back calls across regions would serialise; with per-region
+    // scoping they should both go through without virtual time advancing.
+    let calls = 0;
+    const adapter: AxiosAdapter = async (config) => {
+      calls++;
+      return ok(config, ORDERS_PAYLOAD);
+    };
+
+    // Frozen virtual clock — token refill cannot help here. Both calls must
+    // succeed by holding their own region-scoped burst token.
+    const now = (): number => 1_000_000;
+    const setTimer = (): number => 0;
+    const clearTimer = (): void => {};
+
+    const mkClient = (region: 'eu' | 'na'): SpApiClient =>
+      new SpApiClient({
+        cacheKey: `seller-${region}`,
+        refreshToken: 'rt',
+        credentials: CREDENTIALS,
+        httpAdapter: adapter,
+        region,
+        rateLimits: { getOrders: { rate: 0.0001, burst: 1 } },
+        tokenBucketOptions: { now, setTimer, clearTimer },
+      });
+
+    const eu = mkClient('eu');
+    const na = mkClient('na');
+
+    await eu.getOrders({ marketplaceIds: ['A1F83G8C2ARO7P'], createdAfter: '2026-01-01' });
+    await na.getOrders({ marketplaceIds: ['ATVPDKIKX0DER'], createdAfter: '2026-01-01' });
+
+    expect(calls).toBe(2);
+  });
+
   it('does not tag outbound config with our internal operation field on the wire', async () => {
     let seenConfig: AxiosRequestConfig | undefined;
     const adapter: AxiosAdapter = async (config) => {

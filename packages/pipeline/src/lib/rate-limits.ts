@@ -55,15 +55,17 @@ export const SP_API_RATE_LIMITS = {
 export type SpApiOperation = keyof typeof SP_API_RATE_LIMITS;
 
 /**
- * Build the bucket key for a given operation. Today this is just the operation
- * name — SP-API rate limits are scoped per operation per selling-partner
- * application, and we run a single application across regions.
+ * Build the bucket key for a given operation in a given SP-API region.
  *
- * Multi-region note: if we ever fan out to multiple SP-API regions in
- * parallel, the limits are tracked independently per region by Amazon, so the
- * key would become `${operation}:${region}` and each (operation, region) pair
- * gets its own bucket. The rest of the code already keys buckets by an opaque
- * string, so this expansion is a one-line change here.
+ * SP-API rate limits are scoped *per operation, per region, per
+ * selling-partner application*. EU / NA / FE each maintain independent
+ * usage-plan buckets even when traffic comes from the same SP-API app:
+ *   https://developer-docs.amazon.com/sp-api/docs/usage-plans-and-rate-limits
+ *
+ * Wave 1 keys buckets by `${operation}:${region}` (e.g. `getOrders:eu`). The
+ * `region` argument is required from Phase 4 onward — every call site has
+ * resolved a region from its marketplace id by this point. The legacy
+ * single-arg form is kept for tests that don't care about region scoping.
  */
 export function rateLimitKey(operation: SpApiOperation, region?: string): string {
   return region ? `${operation}:${region}` : operation;

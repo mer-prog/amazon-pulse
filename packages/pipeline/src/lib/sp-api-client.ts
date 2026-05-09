@@ -26,6 +26,11 @@ import {
   type RateLimitSpec,
   type SpApiOperation,
 } from './rate-limits.js';
+import {
+  SP_API_PRODUCTION_ENDPOINTS,
+  SP_API_SANDBOX_ENDPOINTS,
+  type SpApiRegion,
+} from './sp-api-endpoints.js';
 import { TokenBucket, type TokenBucketOptions } from './token-bucket.js';
 import {
   GetOrdersResponseSchema,
@@ -51,7 +56,25 @@ import {
 } from '../schemas/catalog.js';
 
 export interface SpApiClientOptions {
-  /** SP-API endpoint. Defaults to the EU sandbox. */
+  /**
+   * SP-API region. Drives both the endpoint URL and the rate-limit bucket key
+   * (SP-API tracks usage plans independently per region). Defaults to `'eu'`.
+   *
+   * Run one client per region: bucket scoping is `<operation>:<region>`, so
+   * sharing a single client across regions would mis-attribute throttling.
+   */
+  region?: SpApiRegion;
+  /**
+   * Use the production SP-API endpoint for `region`. Defaults to false
+   * (sandbox). Wave 1 is sandbox-first — flipping this is intentionally a
+   * deliberate, per-client opt-in, not a global env switch.
+   */
+  production?: boolean;
+  /**
+   * Explicit endpoint URL override. Bypasses `region` + `production` for the
+   * baseURL (the bucket key still uses `region`). Primarily for tests and
+   * one-off mocks. In production deployments prefer `region`.
+   */
   endpoint?: string;
   /** Cache key for the access token (typically the seller id). */
   cacheKey: string;
@@ -123,7 +146,7 @@ export interface SearchCatalogItemsParams {
   pageToken?: string;
 }
 
-const DEFAULT_SANDBOX_EU = 'https://sandbox.sellingpartnerapi-eu.amazon.com';
+const DEFAULT_REGION: SpApiRegion = 'eu';
 
 /**
  * Custom (non-axios) request-config field used to tag each outbound request
@@ -134,7 +157,16 @@ const OP_FIELD = '__spApiOperation' as const;
 type TaggedConfig = AxiosRequestConfig & { [OP_FIELD]?: SpApiOperation };
 
 function pickEndpoint(opts: SpApiClientOptions): string {
-  return opts.endpoint ?? process.env.SP_API_ENDPOINT ?? DEFAULT_SANDBOX_EU;
+  if (opts.endpoint) return opts.endpoint;
+  if (opts.region) {
+    const map = opts.production ? SP_API_PRODUCTION_ENDPOINTS : SP_API_SANDBOX_ENDPOINTS;
+    return map[opts.region];
+  }
+  // Legacy fallback for callers that pre-date Phase 4: honour SP_API_ENDPOINT
+  // when neither `endpoint` nor `region` is set, then fall back to EU sandbox.
+  // New code paths (run-marketplace-sync etc.) always pass `region` explicitly,
+  // bypassing this branch.
+  return process.env.SP_API_ENDPOINT ?? SP_API_SANDBOX_ENDPOINTS[DEFAULT_REGION];
 }
 
 export class SpApiClient {
@@ -166,7 +198,7 @@ export class SpApiClient {
   }
 
   private bucketFor(operation: SpApiOperation): TokenBucket {
-    const key = rateLimitKey(operation);
+    const key = rateLimitKey(operation, this.opts.region ?? DEFAULT_REGION);
     const existing = this.buckets.get(key);
     if (existing) return existing;
     const spec = this.opts.rateLimits?.[operation] ?? SP_API_RATE_LIMITS[operation];

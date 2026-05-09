@@ -15,6 +15,17 @@ export {
   type SearchCatalogItemsParams,
 } from './lib/sp-api-client.js';
 export {
+  EU_MARKETPLACES,
+  NA_MARKETPLACES,
+  FE_MARKETPLACES,
+  SP_API_SANDBOX_ENDPOINTS,
+  SP_API_PRODUCTION_ENDPOINTS,
+  regionForMarketplace,
+  endpointForMarketplace,
+  groupMarketplacesByRegion,
+  type SpApiRegion,
+} from './lib/sp-api-endpoints.js';
+export {
   getServiceClient,
   getSellerCredentials,
   type SellerCredentials,
@@ -22,6 +33,7 @@ export {
 export {
   newJobRunId,
   runMarketplaceSync,
+  runMarketplaceBatch,
   writeSyncLog,
   type SyncContext,
   type SyncJobType,

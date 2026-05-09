@@ -8,6 +8,10 @@
 
 import { randomUUID } from 'node:crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import {
+  groupMarketplacesByRegion,
+  type SpApiRegion,
+} from './sp-api-endpoints.js';
 
 export type SyncJobType = 'orders' | 'inventory' | 'sales_reports' | 'products';
 export type SyncStatus = 'started' | 'succeeded' | 'failed' | 'partial';
@@ -117,4 +121,75 @@ export async function runMarketplaceSync(
   };
   await writeSyncLog(ctx.supabase, result);
   return result;
+}
+
+/**
+ * Run a sync `body` against every marketplace in `marketplaceIds`, isolating
+ * failures so one marketplace can't abort the rest of the batch.
+ *
+ * Region awareness: marketplaces are grouped by SP-API region first, then
+ * iterated region-by-region. The caller supplies a `clientForRegion` factory
+ * which is invoked once per region encountered — letting the factory hand
+ * back a region-pinned SpApiClient (so the per-region rate-limit buckets stay
+ * separate). The factory result is cached for the duration of the batch.
+ *
+ * Every result row carries `ctx.jobRunId`, so the entire batch is queryable as
+ * one orchestrator run via `sync_logs.job_run_id`.
+ *
+ * The body is responsible for its own try/catch via `runMarketplaceSync`.
+ * If `body` throws synchronously (a programmer bug), the error is captured
+ * into a synthetic `failed` MarketplaceSyncResult so the loop continues — the
+ * batch contract is "all-or-some, never zero".
+ */
+export async function runMarketplaceBatch<C>(
+  ctx: SyncContext,
+  sellerId: string,
+  marketplaceIds: readonly string[],
+  jobType: SyncJobType,
+  clientForRegion: (region: SpApiRegion) => C,
+  body: (
+    ctx: SyncContext,
+    client: C,
+    sellerId: string,
+    marketplaceId: string,
+  ) => Promise<MarketplaceSyncResult>,
+): Promise<MarketplaceSyncResult[]> {
+  const groups = groupMarketplacesByRegion(marketplaceIds);
+  const clientCache = new Map<SpApiRegion, C>();
+  const results: MarketplaceSyncResult[] = [];
+
+  for (const [region, ids] of groups) {
+    let client = clientCache.get(region);
+    if (!client) {
+      client = clientForRegion(region);
+      clientCache.set(region, client);
+    }
+    for (const marketplaceId of ids) {
+      try {
+        results.push(await body(ctx, client, sellerId, marketplaceId));
+      } catch (err) {
+        // body() should always go through runMarketplaceSync (which never
+        // throws). If it did throw, fabricate a failed row so callers still
+        // see the batch result and sync_logs is not silently incomplete.
+        const now = new Date();
+        const failed: MarketplaceSyncResult = {
+          jobRunId: ctx.jobRunId,
+          sellerId,
+          marketplaceId,
+          jobType,
+          status: 'failed',
+          recordsFetched: 0,
+          recordsUpserted: 0,
+          startedAt: now,
+          finishedAt: now,
+          errorCode: 'orchestrator_unhandled',
+          errorMessage: err instanceof Error ? err.message : String(err),
+        };
+        await writeSyncLog(ctx.supabase, failed);
+        results.push(failed);
+      }
+    }
+  }
+
+  return results;
 }
