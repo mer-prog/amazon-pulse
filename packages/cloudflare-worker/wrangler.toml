@@ -1,0 +1,55 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# amazon-pulse / Cloudflare Workers Cron entry
+#
+# Cron Triggers (Free plan allows up to 5; we use 4 with one slot in reserve):
+#   1. orders          — every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
+#   2. inventory       — every 6 hours, offset by 15 min to spread load
+#   3. sales_reports   — daily at 00:00 UTC
+#   4. products        — weekly, Sundays at 00:00 UTC
+#
+# Secrets (set via `wrangler secret put <NAME>`):
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+#   SP_API_CLIENT_ID
+#   SP_API_CLIENT_SECRET
+#   ENCRYPTION_KEY        (base64-encoded 32-byte key)
+#
+# IMPORTANT: this Worker runs against the SP-API SANDBOX endpoint by default.
+# Switching to production is gated by the SP_API_PRODUCTION env var (string
+# "true") and requires production refresh tokens.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name = "amazon-pulse-cron"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# Required: pipeline reuses Node-flavoured APIs (crypto.randomUUID via
+# `node:crypto`, axios, Buffer, etc.). nodejs_compat lights those up on the
+# Workers runtime.
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Default: stay in the SP-API sandbox. Override per-environment.
+SP_API_PRODUCTION = "false"
+
+[[triggers.crons]]
+cron = "0 */6 * * *"        # orders — every 6h on the hour
+
+[[triggers.crons]]
+cron = "15 */6 * * *"       # inventory — every 6h, offset +15min
+
+[[triggers.crons]]
+cron = "0 0 * * *"          # sales_reports — daily 00:00 UTC
+
+[[triggers.crons]]
+cron = "0 0 * * 0"          # products — weekly Sundays 00:00 UTC
+
+# ── Observability ──────────────────────────────────────────────────────────
+[observability]
+enabled = true
+
+# Optional: route this Worker through a custom domain. Configure in the
+# Cloudflare dashboard or uncomment + adjust here.
+# routes = [
+#   { pattern = "cron.amazon-pulse.example.com/*", zone_name = "example.com" }
+# ]
