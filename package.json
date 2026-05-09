@@ -1,0 +1,27 @@
+{
+  "name": "amazon-pulse",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production-grade SP-API data pipeline for Amazon EU/UK sellers (sandbox-first)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "pipeline:dev": "npm run dev --workspace @amazon-pulse/pipeline",
+    "frontend:dev": "npm run dev --workspace @amazon-pulse/frontend",
+    "worker:dev": "npm run dev --workspace @amazon-pulse/cloudflare-worker"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
