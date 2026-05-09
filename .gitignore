@@ -78,6 +78,9 @@ web_modules/
 .next
 out
 
+# Cloudflare Pages / Vercel build output (next-on-pages)
+.vercel
+
 # Nuxt.js build / generate output
 .nuxt
 dist

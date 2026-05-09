@@ -2,6 +2,8 @@ import { createDemoClient } from '../lib/supabase';
 import { loadDashboardSummary, type SellerSummary } from '../lib/queries';
 import { SellerCard } from '../components/SellerCard';
 
+export const runtime = 'edge';
+
 // Always render server-side at request time so the dashboard reflects the
 // most recent sync_logs (cron writes happen out-of-band).
 export const dynamic = 'force-dynamic';
