@@ -2,7 +2,7 @@
   "name": "@amazon-pulse/frontend",
   "version": "0.1.0",
   "private": true,
-  "description": "Next.js 14 dashboard for the amazon-pulse SP-API pipeline (sandbox demo)",
+  "description": "Next.js 15 + React 19 dashboard for the amazon-pulse SP-API pipeline (sandbox demo)",
   "scripts": {
     "dev": "next dev --port 3000",
     "build": "next build",
