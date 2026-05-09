@@ -61,6 +61,37 @@ npm run pipeline:dev
 
 See [`CLAUDE.md`](./CLAUDE.md) for the working agreement and design notes.
 
+## Operational notes
+
+### Encryption key
+
+The pipeline encrypts SP-API refresh tokens at rest with AES-256-GCM. Generate
+a 32-byte key once and put it in `.env.local` (or `wrangler secret put` for the
+Cloudflare Worker):
+
+```bash
+openssl rand -base64 32
+```
+
+### GitHub Actions secrets
+
+Two workflows live under `.github/workflows/`:
+
+| Workflow             | Trigger                | Secrets needed                          |
+|----------------------|------------------------|------------------------------------------|
+| `ci.yml`             | push to main / PR      | _(none — sandbox tests auto-skip)_      |
+| `keepalive.yml`      | every 3 days / manual  | `SUPABASE_URL`, `SUPABASE_ANON_KEY`     |
+
+Configure the keepalive secrets in **Settings → Secrets and variables →
+Actions → New repository secret**:
+
+- `SUPABASE_URL` — e.g. `https://xxxxxxxxxxxx.supabase.co`
+- `SUPABASE_ANON_KEY` — the public anon key (RLS still protects rows)
+
+Free-tier Supabase projects auto-pause after 7 days of inactivity; the
+keepalive workflow issues a single REST `GET` against `sellers` every 3 days
+to keep the project warm.
+
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).

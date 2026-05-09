@@ -66,3 +66,34 @@ export const GetOrdersResponseSchema = z
   })
   .passthrough();
 export type GetOrdersResponse = z.infer<typeof GetOrdersResponseSchema>;
+
+// ── Order items (GET /orders/v0/orders/{orderId}/orderItems) ────────────────
+
+export const OrderItemSchema = z
+  .object({
+    OrderItemId: z.string(),
+    ASIN: z.string().optional(),
+    SellerSKU: z.string().optional(),
+    Title: z.string().optional(),
+    QuantityOrdered: z.number().int().nonnegative(),
+    QuantityShipped: z.number().int().nonnegative().optional(),
+    ItemPrice: MoneySchema.optional(),
+    ItemTax: MoneySchema.optional(),
+    ShippingPrice: MoneySchema.optional(),
+    PromotionDiscount: MoneySchema.optional(),
+  })
+  .passthrough();
+export type OrderItem = z.infer<typeof OrderItemSchema>;
+
+export const GetOrderItemsResponseSchema = z
+  .object({
+    payload: z
+      .object({
+        AmazonOrderId: z.string().optional(),
+        OrderItems: z.array(OrderItemSchema),
+        NextToken: z.string().optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+export type GetOrderItemsResponse = z.infer<typeof GetOrderItemsResponseSchema>;

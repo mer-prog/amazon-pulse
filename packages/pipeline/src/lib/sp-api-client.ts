@@ -15,8 +15,26 @@ import axiosRetry from 'axios-retry';
 import { getValidAccessToken, type LwaCredentials } from './lwa-auth.js';
 import {
   GetOrdersResponseSchema,
+  GetOrderItemsResponseSchema,
   type GetOrdersResponse,
+  type GetOrderItemsResponse,
 } from '../schemas/orders.js';
+import {
+  GetInventorySummariesResponseSchema,
+  type GetInventorySummariesResponse,
+} from '../schemas/inventory.js';
+import {
+  CreateReportResponseSchema,
+  ReportDocumentSchema,
+  ReportSchema,
+  type CreateReportResponse,
+  type Report,
+  type ReportDocument,
+} from '../schemas/reports.js';
+import {
+  SearchCatalogItemsResponseSchema,
+  type SearchCatalogItemsResponse,
+} from '../schemas/catalog.js';
 
 export interface SpApiClientOptions {
   /** SP-API endpoint. Defaults to the EU sandbox. */
@@ -41,6 +59,37 @@ export interface GetOrdersParams {
   fulfillmentChannels?: string[];
   maxResultsPerPage?: number;
   nextToken?: string;
+}
+
+export interface GetOrderItemsParams {
+  amazonOrderId: string;
+  nextToken?: string;
+}
+
+export interface GetInventorySummariesParams {
+  marketplaceIds: string[];
+  granularityType?: 'Marketplace';
+  granularityId?: string;
+  details?: boolean;
+  sellerSkus?: string[];
+  nextToken?: string;
+}
+
+export interface CreateReportParams {
+  reportType: string;
+  marketplaceIds: string[];
+  dataStartTime?: string;
+  dataEndTime?: string;
+  reportOptions?: Record<string, string>;
+}
+
+export interface SearchCatalogItemsParams {
+  marketplaceIds: string[];
+  identifiers?: string[];
+  identifiersType?: 'ASIN' | 'EAN' | 'GTIN' | 'ISBN' | 'JAN' | 'MINSAN' | 'SKU' | 'UPC';
+  includedData?: Array<'attributes' | 'images' | 'productTypes' | 'salesRanks' | 'summaries'>;
+  pageSize?: number;
+  pageToken?: string;
 }
 
 const DEFAULT_SANDBOX_EU = 'https://sandbox.sellingpartnerapi-eu.amazon.com';
@@ -80,10 +129,8 @@ export class SpApiClient {
     };
   }
 
-  /**
-   * GET /orders/v0/orders — list orders for one or more marketplaces.
-   * At least one of CreatedAfter / LastUpdatedAfter is required by the API.
-   */
+  // ── Orders v0 ────────────────────────────────────────────────────────────
+
   async getOrders(params: GetOrdersParams): Promise<GetOrdersResponse> {
     if (!params.createdAfter && !params.lastUpdatedAfter) {
       throw new Error('getOrders requires either createdAfter or lastUpdatedAfter');
@@ -105,10 +152,111 @@ export class SpApiClient {
     }
     if (params.nextToken) query['NextToken'] = params.nextToken;
 
-    const { data } = await this.http.get('/orders/v0/orders', {
+    const { data } = await this.http.get('/orders/v0/orders', { headers, params: query });
+    return GetOrdersResponseSchema.parse(data);
+  }
+
+  async getOrderItems(params: GetOrderItemsParams): Promise<GetOrderItemsResponse> {
+    const headers = await this.authHeaders();
+    const query: Record<string, string> = {};
+    if (params.nextToken) query['NextToken'] = params.nextToken;
+    const { data } = await this.http.get(
+      `/orders/v0/orders/${encodeURIComponent(params.amazonOrderId)}/orderItems`,
+      { headers, params: query },
+    );
+    return GetOrderItemsResponseSchema.parse(data);
+  }
+
+  // ── FBA Inventory v1 ─────────────────────────────────────────────────────
+
+  async getInventorySummaries(
+    params: GetInventorySummariesParams,
+  ): Promise<GetInventorySummariesResponse> {
+    const headers = await this.authHeaders();
+    const granId = params.granularityId ?? params.marketplaceIds[0];
+    if (!granId) throw new Error('getInventorySummaries requires at least one marketplaceId');
+    const query: Record<string, string | number | boolean> = {
+      granularityType: params.granularityType ?? 'Marketplace',
+      granularityId: granId,
+      marketplaceIds: params.marketplaceIds.join(','),
+      details: params.details ?? true,
+    };
+    if (params.sellerSkus?.length) query['sellerSkus'] = params.sellerSkus.join(',');
+    if (params.nextToken) query['nextToken'] = params.nextToken;
+    const { data } = await this.http.get('/fba/inventory/v1/summaries', {
       headers,
       params: query,
     });
-    return GetOrdersResponseSchema.parse(data);
+    return GetInventorySummariesResponseSchema.parse(data);
+  }
+
+  // ── Reports 2021-06-30 ───────────────────────────────────────────────────
+
+  async createReport(params: CreateReportParams): Promise<CreateReportResponse> {
+    const headers = { ...(await this.authHeaders()), 'Content-Type': 'application/json' };
+    const body: Record<string, unknown> = {
+      reportType: params.reportType,
+      marketplaceIds: params.marketplaceIds,
+    };
+    if (params.dataStartTime) body['dataStartTime'] = params.dataStartTime;
+    if (params.dataEndTime) body['dataEndTime'] = params.dataEndTime;
+    if (params.reportOptions) body['reportOptions'] = params.reportOptions;
+    const { data } = await this.http.post('/reports/2021-06-30/reports', body, { headers });
+    return CreateReportResponseSchema.parse(data);
+  }
+
+  async getReport(reportId: string): Promise<Report> {
+    const headers = await this.authHeaders();
+    const { data } = await this.http.get(
+      `/reports/2021-06-30/reports/${encodeURIComponent(reportId)}`,
+      { headers },
+    );
+    return ReportSchema.parse(data);
+  }
+
+  async getReportDocument(reportDocumentId: string): Promise<ReportDocument> {
+    const headers = await this.authHeaders();
+    const { data } = await this.http.get(
+      `/reports/2021-06-30/documents/${encodeURIComponent(reportDocumentId)}`,
+      { headers },
+    );
+    return ReportDocumentSchema.parse(data);
+  }
+
+  /**
+   * Download the raw report payload from the presigned S3 URL returned by
+   * getReportDocument. Returns the response body as a string. Caller is
+   * responsible for parsing (JSON / TSV / etc) and gunzipping if compressed.
+   */
+  async downloadReportDocumentText(url: string): Promise<string> {
+    const { data } = await axios.get<string>(url, {
+      timeout: 60_000,
+      responseType: 'text',
+      transformResponse: (raw) => raw,
+    });
+    return data;
+  }
+
+  // ── Catalog Items 2022-04-01 ─────────────────────────────────────────────
+
+  async searchCatalogItems(
+    params: SearchCatalogItemsParams,
+  ): Promise<SearchCatalogItemsResponse> {
+    const headers = await this.authHeaders();
+    const query: Record<string, string | number> = {
+      marketplaceIds: params.marketplaceIds.join(','),
+    };
+    if (params.identifiers?.length) {
+      query['identifiers'] = params.identifiers.join(',');
+      query['identifiersType'] = params.identifiersType ?? 'ASIN';
+    }
+    if (params.includedData?.length) query['includedData'] = params.includedData.join(',');
+    if (params.pageSize !== undefined) query['pageSize'] = params.pageSize;
+    if (params.pageToken) query['pageToken'] = params.pageToken;
+    const { data } = await this.http.get('/catalog/2022-04-01/items', {
+      headers,
+      params: query,
+    });
+    return SearchCatalogItemsResponseSchema.parse(data);
   }
 }
